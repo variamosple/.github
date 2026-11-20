@@ -1,0 +1,253 @@
+# Shared deployment of the VariaMos services.
+#
+# A service repository calls it from a short workflow (see README.md and
+# workflow-templates/deploy.yml). It runs in the context of the calling
+# repository: its secrets, its variables and its "production" environment.
+#
+# Steps: build the image, check it, publish it on Docker Hub, deploy only this
+# service on the production server, then, when a health URL is given, wait for
+# the new container and roll back to the previous image if it does not answer.
+#
+# Until the server restructuring, it connects with the shared SSH secrets
+# (AWS_HOST, AWS_USERNAME, VARIAMOS_AWS_PEM). At the cutover, only this file
+# changes: one deploy key per repository, and a forced "deploy <service>"
+# command on the server.
+name: deploy
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: Image name on Docker Hub, without registry, account or tag (for example vms_projects)
+        type: string
+        required: true
+      service:
+        description: Service name in the production compose file (for example vmslanguagereviewsaws)
+        type: string
+        required: true
+      context:
+        description: Build context
+        type: string
+        default: .
+      dockerfile:
+        description: Path of the Dockerfile
+        type: string
+        default: ./Dockerfile
+      build-env:
+        description: >-
+          Lines NAME=value appended to .env before the build, for the frontends
+          that read their settings at build time. Only values that are not
+          secret: a secret written into an image is public with the image.
+        type: string
+        default: ''
+      scan:
+        description: >-
+          "report": show the image flaws and forbidden files without failing.
+          "block": fail on a secret, a critical flaw that has a fix, or an
+          environment or key file in the image.
+        type: string
+        default: report
+      allowed-files:
+        description: Image paths that the file check accepts, one per line (for example etc/nginx/variamos/build.env)
+        type: string
+        default: ''
+      health-url:
+        description: Health URL of the service. Empty means no health check and no automatic rollback.
+        type: string
+        default: ''
+      health-name:
+        description: serviceName expected in the health answer
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    # One deployment at a time per repository: the rollback puts back the
+    # image that was in service before this run.
+    concurrency:
+      group: deploy-${{ github.repository }}
+      cancel-in-progress: false
+    env:
+      SERVICE: ${{ inputs.service }}
+      IMAGE_NAME: ${{ inputs.image }}
+      TRIVY_IMAGE: aquasec/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c
+    steps:
+      - name: Check the inputs
+        env:
+          SCAN: ${{ inputs.scan }}
+          HEALTH_URL: ${{ inputs.health-url }}
+          HEALTH_NAME: ${{ inputs.health-name }}
+        run: |
+          # The service name is written into the commands run on the server.
+          [[ "$SERVICE" =~ ^[a-z0-9_-]+$ ]] || { echo "::error::service must match [a-z0-9_-]+"; exit 1; }
+          [[ "$IMAGE_NAME" =~ ^[a-z0-9_.-]+$ ]] || { echo "::error::image must match [a-z0-9_.-]+"; exit 1; }
+          [[ "$SCAN" == report || "$SCAN" == block ]] || { echo "::error::scan must be report or block"; exit 1; }
+          if [[ -n "$HEALTH_URL" && -z "$HEALTH_NAME" ]]; then
+            echo "::error::health-name is required with health-url"; exit 1
+          fi
+
+      - uses: actions/checkout@v7
+
+      - name: Write the build settings
+        if: inputs.build-env != ''
+        env:
+          BUILD_ENV: ${{ inputs.build-env }}
+        run: printf '%s\n' "$BUILD_ENV" >> .env
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to the registry
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ${{ vars.ACR_DOKCERHUB }}
+          username: ${{ secrets.ACRUSERNAME_DOKCERHUB }}
+          password: ${{ secrets.ACRUSERPASSWORD_DOKCERHUB }}
+
+      - name: Build the image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          load: true
+          tags: image-to-check
+
+      - name: Check the image
+        env:
+          SCAN: ${{ inputs.scan }}
+          ALLOWED_FILES: ${{ inputs.allowed-files }}
+        run: |
+          mkdir -p "$HOME/.cache/trivy"
+          trivy() {
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock:ro \
+              -v "$HOME/.cache/trivy:/root/.cache/trivy" "$TRIVY_IMAGE" \
+              image --no-progress "$@" image-to-check
+          }
+          problems=()
+          echo "::group::High flaws that have a fix (never blocking)"
+          trivy --scanners vuln --severity HIGH --ignore-unfixed || true
+          echo "::endgroup::"
+          echo "::group::Secrets"
+          trivy --scanners secret --exit-code 1 || problems+=("a secret is in the image")
+          echo "::endgroup::"
+          echo "::group::Critical flaws that have a fix"
+          trivy --scanners vuln --severity CRITICAL --ignore-unfixed --exit-code 1 || problems+=("critical flaws that have a fix")
+          echo "::endgroup::"
+          echo "::group::Environment and key files"
+          container="$(docker create image-to-check)"
+          found="$(docker export "$container" | tar -t \
+            | grep -E '(^|/)(\.env(\.[^/]+)?|[^/]+\.env)$|(^|/)([^/]+\.(key|pem|p12|pfx|jks|keystore)|id_(rsa|dsa|ecdsa|ed25519)[^/]*|credentials[^/]*\.json)$' \
+            | grep -vE '(^|/)node_modules/|^etc/ssl[^/]*/|^usr/share/ca-certificates/|^usr/local/share/ca-certificates/' \
+            | grep -vxF -e "${ALLOWED_FILES:-/nothing-allowed/}" || true)"
+          docker rm "$container" >/dev/null
+          if [[ -n "$found" ]]; then
+            echo "Files that must not be published:"
+            while IFS= read -r path; do echo "  /$path"; done <<<"$found"
+            problems+=("environment or key files in the image")
+          else
+            echo "No environment file and no key in the image."
+          fi
+          echo "::endgroup::"
+          if (( ${#problems[@]} )); then
+            for p in "${problems[@]}"; do
+              if [[ "$SCAN" == block ]]; then echo "::error::$p"; else echo "::warning::$p"; fi
+            done
+            [[ "$SCAN" == block ]] && exit 1
+          fi
+          exit 0
+
+      - name: Publish the image
+        env:
+          IMAGE: ${{ vars.ACR_DOKCERHUB }}/${{ secrets.ACRUSERNAME_DOKCERHUB }}/${{ inputs.image }}:main
+        run: |
+          docker tag image-to-check "$IMAGE"
+          docker push "$IMAGE"
+
+      - name: Record the deployment start
+        run: echo "DEPLOY_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Deploy the service on the server
+        uses: appleboy/ssh-action@c4f70287fc37c43b14b30b407224bbbc8e8c6327 # master of 2026-08-16: v1.2.5 plus the drone-ssh checksum check
+        with:
+          host: ${{ secrets.AWS_HOST }}
+          username: ${{ secrets.AWS_USERNAME }}
+          key: ${{ secrets.VARIAMOS_AWS_PEM }}
+          script: |
+            set -e
+            compose() { docker compose --env-file .env.aws.develop -f docker-compose-aws-develop-nginx.yml "$@"; }
+            # Keep the image in service: the rollback step puts it back
+            previous=$(docker inspect -f '{{.Image}}' "$(compose ps -q ${{ inputs.service }})" 2>/dev/null || true)
+            if [ -n "$previous" ]; then docker tag "$previous" ${{ inputs.service }}:rollback; fi
+            compose pull ${{ inputs.service }}
+            compose up -d ${{ inputs.service }}
+            docker image prune -f
+
+      - name: Check the deployed service answers
+        id: health
+        if: inputs.health-url != ''
+        env:
+          HEALTH_URL: ${{ inputs.health-url }}
+          SERVICE_NAME: ${{ inputs.health-name }}
+        run: |
+          deadline=$(( $(date +%s) + 300 ))
+          while :; do
+            body=$(curl -sS --max-time 10 "$HEALTH_URL" || true)
+            max_uptime=$(( $(date +%s) - DEPLOY_STARTED_AT + 60 ))
+            if echo "$body" | jq -e --arg name "$SERVICE_NAME" --argjson max "$max_uptime" \
+              '.serviceName == $name and .status == "UP" and .uptimeSeconds <= $max' >/dev/null 2>&1; then
+              echo "$SERVICE_NAME is UP: $(echo "$body" | jq -c '{status, version, uptimeSeconds}')"
+              exit 0
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::$SERVICE_NAME did not answer UP from the new container within 5 minutes"
+              echo "Last answer: $(echo "$body" | head -c 500)"
+              exit 1
+            fi
+            sleep 10
+          done
+
+      - name: Roll back to the previous image
+        id: rollback
+        if: failure() && steps.health.outcome == 'failure'
+        uses: appleboy/ssh-action@c4f70287fc37c43b14b30b407224bbbc8e8c6327 # master of 2026-08-16: v1.2.5 plus the drone-ssh checksum check
+        with:
+          host: ${{ secrets.AWS_HOST }}
+          username: ${{ secrets.AWS_USERNAME }}
+          key: ${{ secrets.VARIAMOS_AWS_PEM }}
+          script: |
+            set -e
+            compose() { docker compose --env-file .env.aws.develop -f docker-compose-aws-develop-nginx.yml "$@"; }
+            container=$(compose ps -a -q ${{ inputs.service }})
+            if ! docker image inspect ${{ inputs.service }}:rollback >/dev/null 2>&1; then
+              echo "No previous image kept: nothing to roll back to"
+              exit 1
+            fi
+            if [ "$(docker inspect -f '{{.Image}}' "$container")" = "$(docker image inspect -f '{{.Id}}' ${{ inputs.service }}:rollback)" ]; then
+              echo "The service still runs the previous image: nothing was rolled back"
+              exit 1
+            fi
+            docker tag ${{ inputs.service }}:rollback "$(docker inspect -f '{{.Config.Image}}' "$container")"
+            compose up -d --force-recreate --pull never ${{ inputs.service }}
+            echo "Rolled back to the previous image"
+
+      - name: Check the rolled back service answers
+        if: failure() && steps.rollback.outcome == 'success'
+        env:
+          HEALTH_URL: ${{ inputs.health-url }}
+          SERVICE_NAME: ${{ inputs.health-name }}
+        run: |
+          deadline=$(( $(date +%s) + 300 ))
+          until curl -sS --max-time 10 "$HEALTH_URL" | jq -e --arg name "$SERVICE_NAME" \
+            '.serviceName == $name and .status == "UP"' >/dev/null 2>&1; do
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::$SERVICE_NAME does not answer UP after the rollback either"
+              exit 1
+            fi
+            sleep 10
+          done
+          echo "::warning::$SERVICE_NAME was rolled back to the previous image and answers UP"

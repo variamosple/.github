@@ -1,0 +1,7 @@
+{
+  "name": "VariaMos deployment",
+  "description": "Build, check and publish the image of a VariaMos service, then deploy it on the production server with the shared workflow.",
+  "iconName": "deploy",
+  "categories": ["Deployment", "Dockerfile"],
+  "filePatterns": ["Dockerfile$"]
+}

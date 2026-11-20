@@ -1,0 +1,21 @@
+# Deploys this service with the shared VariaMos workflow.
+# Replace the two CHANGE_ME values, then see the README of variamosple/.github.
+name: deploy
+
+on:
+  push:
+    branches: [$default-branch]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    uses: variamosple/.github/.github/workflows/deploy.yml@v1
+    with:
+      # Image name on Docker Hub, without registry, account or tag
+      image: CHANGE_ME
+      # Service name in the production compose file
+      service: CHANGE_ME
+      # Optional: health check and automatic rollback
+      # health-url: https://app.variamos.com/CHANGE_ME/health
+      # health-name: CHANGE_ME
+    secrets: inherit
