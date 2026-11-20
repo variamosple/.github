@@ -36,9 +36,10 @@ on:
         default: ./Dockerfile
       build-env:
         description: >-
-          Lines NAME=value appended to .env before the build, for the frontends
-          that read their settings at build time. Only values that are not
-          secret: a secret written into an image is public with the image.
+          Lines NAME=value written to .env before the build, for the frontends
+          that read their settings at build time; they replace any .env of the
+          repository. Only values that are not secret: a secret written into
+          an image is public with the image.
         type: string
         default: ''
       scan:
@@ -65,7 +66,8 @@ on:
           Page URL of a frontend (for example https://app.variamos.com/variamos_laboratory/).
           The deployment waits for this page to be the one built by this run
           (Last-Modified after the build start) and for its main script to
-          load, and otherwise rolls back. Not used with health-url.
+          load (Create React App static/js/main.*.js or Vite assets/*.js), and
+          otherwise rolls back. Not used with health-url.
         type: string
         default: ''
 
@@ -125,7 +127,7 @@ jobs:
             echo "::error::build settings without a value (missing GitHub variable?):$empty"
             exit 1
           fi
-          printf '%s\n' "$BUILD_ENV" >> .env
+          printf '%s\n' "$BUILD_ENV" > .env
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -173,7 +175,7 @@ jobs:
           container="$(docker create image-to-check)"
           found="$(docker export "$container" | tar -t \
             | grep -E '(^|/)(\.env(\.[^/]+)?|[^/]+\.env)$|(^|/)([^/]+\.(key|pem|p12|pfx|jks|keystore)|id_(rsa|dsa|ecdsa|ed25519)[^/]*|credentials[^/]*\.json)$' \
-            | grep -vE '(^|/)node_modules/|^etc/ssl[^/]*/|^usr/share/ca-certificates/|^usr/local/share/ca-certificates/' \
+            | grep -vE '(^|/)(node_modules|site-packages|dist-packages)/|^etc/ssl[^/]*/|^usr/lib/ssl/|^usr/share/ca-certificates/|^usr/local/share/ca-certificates/|^tmp/[^/]*cacert\.pem$' \
             | grep -vxF -e "${ALLOWED_FILES:-/nothing-allowed/}" || true)"
           docker rm "$container" >/dev/null
           if [[ -n "$found" ]]; then
@@ -254,7 +256,7 @@ jobs:
             problem=""
             headers=$(curl -sS --max-time 10 -o page.html -D - "$PAGE_URL" || true)
             modified=$(echo "$headers" | tr -d '\r' | sed -n 's/^[Ll]ast-[Mm]odified: //p' | tail -1)
-            script=$(grep -oE 'src="/[^"]*static/js/main\.[A-Za-z0-9]+\.js"' page.html 2>/dev/null | head -1 | cut -d'"' -f2)
+            script=$(grep -oE 'src="/[^"]*(static/js/main\.[A-Za-z0-9]+|assets/[A-Za-z0-9_.-]+)\.js"' page.html 2>/dev/null | head -1 | cut -d'"' -f2)
             if ! echo "$headers" | grep -qE '^HTTP/[0-9.]+ 200'; then
               problem="the page does not answer 200"
             elif [ -z "$modified" ] || [ "$(date -d "$modified" +%s)" -lt "$BUILD_STARTED_AT" ]; then
