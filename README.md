@@ -43,8 +43,10 @@ What it does:
 3. publishes it on Docker Hub with the `main` tag;
 4. on the server, keeps the image in service, then pulls and restarts **only
    this service**;
-5. with `health-url`: waits up to 5 minutes for the new container to answer
-   `{"serviceName": <health-name>, "status": "UP"}` with a fresh uptime, and
+5. with `health-url` (backend): waits up to 5 minutes for the new container to
+   answer `{"serviceName": <health-name>, "status": "UP"}` with a fresh uptime;
+   with `page-url` (frontend): waits up to 5 minutes for the page to answer 200
+   with a `Last-Modified` after the build start and a main script that loads;
    otherwise puts the previous image back.
 
 ### Inputs
@@ -55,11 +57,12 @@ What it does:
 | `service` | required | Service name in the production compose file |
 | `context` | `.` | Build context |
 | `dockerfile` | `./Dockerfile` | Path of the Dockerfile |
-| `build-env` | empty | Lines `NAME=value` appended to `.env` before the build, for the frontends. Pass `vars`, never secrets: anything in an image is public |
+| `build-env` | empty | Lines `NAME=value` appended to `.env` before the build, for the frontends. Pass `vars`, never secrets: anything in an image is public. A line without a value (missing variable) fails the run |
 | `scan` | `report` | `report` shows the problems, `block` fails on a secret, a critical flaw that has a fix, or an environment or key file in the image |
 | `allowed-files` | empty | Image paths the file check accepts, one per line |
 | `health-url` | empty | Health URL; empty means no check and no automatic rollback |
 | `health-name` | empty | `serviceName` expected in the health answer (required with `health-url`) |
+| `page-url` | empty | Page of a frontend to check instead of a health URL, for example `https://app.variamos.com/variamos_laboratory/` |
 
 Example for a frontend that reads its settings at build time:
 
@@ -67,6 +70,7 @@ Example for a frontend that reads its settings at build time:
     with:
       image: variamosple
       service: variamospleaws
+      page-url: https://app.variamos.com/
       build-env: |
         REACT_APP_HOST=${{ vars.REACT_APP_HOST }}
         REACT_APP_URLVMSPROJECTS=${{ vars.REACT_APP_URLVMSPROJECTS }}
