@@ -46,7 +46,8 @@ What it does:
 5. with `health-url` (backend): waits up to 5 minutes for the new container to
    answer `{"serviceName": <health-name>, "status": "UP"}` with a fresh uptime;
    with `page-url` (frontend): waits up to 5 minutes for the page to answer 200
-   with a `Last-Modified` after the build start and a main script that loads;
+   with a `Last-Modified` after the build start and a main script that loads
+   (Create React App `static/js/main.*.js` or Vite `assets/*.js`);
    otherwise puts the previous image back.
 
 ### Inputs
@@ -57,7 +58,7 @@ What it does:
 | `service` | required | Service name in the production compose file |
 | `context` | `.` | Build context |
 | `dockerfile` | `./Dockerfile` | Path of the Dockerfile |
-| `build-env` | empty | Lines `NAME=value` appended to `.env` before the build, for the frontends. Pass `vars`, never secrets: anything in an image is public. A line without a value (missing variable) fails the run |
+| `build-env` | empty | Lines `NAME=value` written to `.env` before the build (they replace any `.env` of the repository), for the frontends. Pass `vars`, never secrets: anything in an image is public. A line without a value (missing variable) fails the run |
 | `scan` | `report` | `report` shows the problems, `block` fails on a secret, a critical flaw that has a fix, or an environment or key file in the image |
 | `allowed-files` | empty | Image paths the file check accepts, one per line |
 | `health-url` | empty | Health URL; empty means no check and no automatic rollback |
